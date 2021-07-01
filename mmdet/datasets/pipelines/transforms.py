@@ -1,9 +1,11 @@
-import functools
 import inspect
-
-import mmcv
+from PIL import Image
+import mmcv,cv2,os,random
 import numpy as np
+import json
+from icecream import ic
 from numpy import random
+import random as small_random
 
 from mmdet.core import PolygonMasks
 from mmdet.core.evaluation.bbox_overlaps import bbox_overlaps
@@ -21,25 +23,706 @@ except ImportError:
     albumentations = None
     Compose = None
 
+@PIPELINES.register_module
+class SmallObjectAugmentation(object):
+    def __init__(self, thresh=64*64, prob=0.5, copy_times=3, epochs=30, all_objects=False, one_object=False):
+        """
+        sample = {'img':img, 'annot':annots}
+        img = [height, width, 3]
+        annot = [xmin, ymin, xmax, ymax, label]
+        thresh：the detection threshold of the small object. If annot_h * annot_w < thresh, the object is small
+        prob: the prob to do small object augmentation
+        epochs: the epochs to do
+        """
+        self.thresh = thresh
+        self.prob = prob
+        self.copy_times = copy_times
+        self.epochs = epochs
+        self.all_objects = all_objects
+        self.one_object = one_object
+        if self.all_objects or self.one_object:
+            self.copy_times = 1
 
-def imwrite_denormalized_debug_img(func):
-    """Write denormalized debug image to file."""
+        #self.num = 0
 
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        """Write denormalized debug image to file."""
-        results = func(*args, **kwargs)
-        vis_img = mmcv.imdenormalize(
-            results['img'],
-            mean=np.array([123.675, 116.28, 103.53], dtype=np.float32),
-            std=np.array([58.395, 57.12, 57.375], dtype=np.float32),
-            to_bgr=True)
-        random_img_id = random.randint(10)
-        filename = f'debug_img_{random_img_id}.png'
-        mmcv.imwrite(vis_img, filename)
+    def issmallobject(self, h, w):
+        if h * w <= self.thresh:
+            return True
+        else:
+            return False
+
+    def compute_overlap(self, annot_a, annot_b):
+        if annot_a is None: return False
+        left_max = max(annot_a[0], annot_b[0])
+        top_max = max(annot_a[1], annot_b[1])
+        right_min = min(annot_a[2], annot_b[2])
+        bottom_min = min(annot_a[3], annot_b[3])
+        inter = max(0, (right_min-left_max)) * max(0, (bottom_min-top_max))
+        if inter != 0:
+            return True
+        else:
+            return False
+
+    def donot_overlap(self, new_annot, annots):
+        for annot in annots:
+            if self.compute_overlap(new_annot, annot): return False
+        return True
+
+    def create_copy_annot(self, h, w, annot, annots):
+        annot = annot.astype(np.int)
+        annot_h, annot_w = annot[3] - annot[1], annot[2] - annot[0]
+        for epoch in range(self.epochs):
+            random_x, random_y = np.random.randint(int(annot_w / 2), int(w - annot_w / 2)), \
+                                 np.random.randint(int(annot_h / 2), int(h - annot_h / 2))
+            xmin, ymin = random_x - annot_w / 2, random_y - annot_h / 2
+            xmax, ymax = xmin + annot_w, ymin + annot_h
+            if xmin < 0 or xmax > w or ymin < 0 or ymax > h:
+                continue
+            new_annot = np.array([xmin, ymin, xmax, ymax]).astype(np.int)
+
+            if self.donot_overlap(new_annot, annots) is False:
+                continue
+
+            return new_annot
+        return None
+
+    def add_patch_in_img(self, annot, copy_annot, image):
+        copy_annot = copy_annot.astype(np.int)
+        image[annot[1]:annot[3], annot[0]:annot[2], :] = image[copy_annot[1]:copy_annot[3], copy_annot[0]:copy_annot[2], :]
+        return image
+
+    def __call__(self, sample):
+        if self.all_objects and self.one_object: return sample
+        if np.random.rand() > self.prob: return sample
+
+        img, annots, gt_labels = sample['img'], sample['gt_bboxes'], sample['gt_labels']
+        print(type(annots),type(gt_labels))
+        h, w= img.shape[0], img.shape[1]
+
+        small_object_list = list()
+        for idx in range(annots.shape[0]):
+            annot = annots[idx]
+            annot_h, annot_w = annot[3] - annot[1], annot[2] - annot[0]
+            if self.issmallobject(annot_h, annot_w):
+                small_object_list.append(idx)
+
+        l = len(small_object_list)
+        # No Small Object
+        if l == 0: return sample
+
+        # Refine the copy_object by the given policy
+        # Policy 2:
+        copy_object_num = np.random.randint(0, l)
+        # Policy 3:
+        if self.all_objects:
+            copy_object_num = l
+        # Policy 1:
+        if self.one_object:
+            copy_object_num = 1
+
+        random_list = small_random.sample(range(l), copy_object_num)
+        annot_idx_of_small_object = [small_object_list[idx] for idx in random_list]
+        select_annots = annots[annot_idx_of_small_object, :]
+        select_gt_labels = gt_labels[annot_idx_of_small_object]
+        annots = annots.tolist()
+        gt_labels = gt_labels.tolist()
+        for idx in range(copy_object_num):
+            annot = select_annots[idx]
+            gt_label = select_gt_labels[idx]
+            annot_h, annot_w = annot[3] - annot[1], annot[2] - annot[0]
+
+            if self.issmallobject(annot_h, annot_w) is False: continue
+
+            for i in range(self.copy_times):
+                new_annot = self.create_copy_annot(h, w, annot, annots)
+                if new_annot is not None:
+                    img = self.add_patch_in_img(new_annot, annot, img)
+                    annots.append(new_annot)
+                    gt_labels.append(gt_label)
+
+        sample['img'] = img
+        sample['gt_bboxes'] = annots
+        sample['gt_labels'] = gt_labels
+
+        #print("****************SmallObjectAugmentation****************")
+        #draw_img = img.copy()
+        #for bboxes in sample['gt_bboxes']:
+        #    cv2.rectangle(draw_img,(int(bboxes[0]),int(bboxes[1])),(int(bboxes[2]),int(bboxes[3])),(0,0,255),3)
+        #cv2.imwrite("/home/willer/tianchi/mmd_solution/UniverseNet/mmdet/datasets/pipelines/output/" + str(self.num) + ".jpg",draw_img)
+        #self.num+=1
+
+        return sample
+
+
+@PIPELINES.register_module
+class Mixup(object):
+    def __init__(self, p=0.3, lambd=0.5):
+        self.lambd = lambd
+        self.p = p
+        self.img2 = None
+        self.boxes2 = None
+        self.labels2= None
+
+    def __call__(self, results):
+        img1, boxes1, labels1 = [
+            results[k] for k in ('img', 'gt_bboxes', 'gt_labels')
+        ]
+        if random.random() < self.p and self.img2 is not None and img1.shape[1]==self.img2.shape[1]:
+            #print("***********",img1.shape,"**************")
+            
+            height = max(img1.shape[0], self.img2.shape[0])
+            width = max(img1.shape[1], self.img2.shape[1])
+            mixup_image = np.zeros([height, width, 3], dtype='float32')
+            mixup_image[:img1.shape[0], :img1.shape[1], :] = img1.astype('float32') * self.lambd
+            mixup_image[:self.img2.shape[0], :self.img2.shape[1], :] += self.img2.astype('float32') * (1. - self.lambd)
+            mixup_image = mixup_image.astype('uint8')
+            mixup_boxes = np.vstack((boxes1, self.boxes2))
+            mixup_label = np.hstack((labels1,self.labels2))            
+            results['img'] = mixup_image
+            results['gt_bboxes'] = mixup_boxes
+            results['gt_labels'] = mixup_label
+        else: 
+            pass
+        self.img2 = img1
+        self.boxes2 = boxes1
+        self.labels2 =  labels1
         return results
 
-    return wrapper
+@PIPELINES.register_module
+class Mixup_v1(object):
+    """Mixup images & bbox
+    Args:
+        prob (float): the probability of carrying out mixup process.
+        lambd (float): the parameter for mixup.
+        mixup (bool): mixup switch.
+        json_path (string): the path to dataset json file.
+    """
+
+    def __init__(self, prob=0.5, lambd=0.5, mixup=False,
+                 json_path='data/coco/annotations/pgtrainval2017.json',
+                 img_path='data/coco/images/',backup_path='/home/willer/tianchi/panda/yolov5_crop/yolov5/data/coco/images_crop_backup/'):
+        self.lambd = lambd
+        self.prob = prob
+        self.mixup = mixup
+        self.json_path = json_path
+        self.img_path = img_path
+        self.backup_path = backup_path
+        self.backup_imgs = os.listdir(self.backup_path)
+        self.backup_length = len(self.backup_imgs)
+        with open(json_path, 'r') as json_file:
+            all_labels = json.load(json_file)
+        self.all_labels = all_labels
+
+    def get_img2(self):
+        # random get image2 for mixup
+        idx2 = np.random.choice(np.arange(len(self.all_labels['images'])))
+        img2_fn = self.all_labels['images'][idx2]['file_name']
+        img2_id = self.all_labels['images'][idx2]['id']
+        img2_path = self.img_path + img2_fn
+        img2 = mmcv.imread(img2_path)
+
+        # get image2 label
+        labels2 = []
+        boxes2 = []
+        for annt in self.all_labels['annotations']:
+            if annt['image_id'] == img2_id:
+                labels2.append(np.int64(annt['category_id']))
+                boxes2.append([np.float32(annt['bbox'][0]),
+                               np.float32(annt['bbox'][1]),
+                               np.float32(annt['bbox'][0] + annt['bbox'][2] - 1),
+                               np.float32(annt['bbox'][1] + annt['bbox'][3] - 1)])
+        return img2, labels2, boxes2
+
+    def __call__(self, results):
+        if self.mixup == True:
+            if random.uniform(0, 1) > self.prob:
+                img1 = results['img']
+                labels1 = results['gt_labels']
+
+                if random.uniform(0, 1) > self.prob:
+                    self.lambd = 0.5  # float(round(random.uniform(0.5,0.9),1))
+                    idx = random.randint(0,self.backup_length)
+                    img2 = cv2.imread(os.path.join(self.backup_path,self.backup_imgs[idx]))
+                    height = max(img1.shape[0], img2.shape[0])
+                    width = max(img1.shape[1], img2.shape[1])
+                    mixup_image = np.zeros([height, width, 3], dtype='float32')
+                    mixup_image[:img1.shape[0], :img1.shape[1], :] = img1.astype('float32') * self.lambd
+                    mixup_image[:img2.shape[0], :img2.shape[1], :] += img2.astype('float32') * (1. - self.lambd)
+                    mixup_image = mixup_image.astype('uint8')
+                else:
+                    # mix image
+                    img2, labels2, boxes2 = self.get_img2()
+                    height = max(img1.shape[0], img2.shape[0])
+                    width = max(img1.shape[1], img2.shape[1])
+                    mixup_image = np.zeros([height, width, 3], dtype='float32')
+                    mixup_image[:img1.shape[0], :img1.shape[1], :] = img1.astype('float32') * self.lambd
+                    mixup_image[:img2.shape[0], :img2.shape[1], :] += img2.astype('float32') * (1. - self.lambd)
+                    mixup_image = mixup_image.astype('uint8')
+
+                    # mix labels
+                    results['gt_labels'] = np.hstack((labels1, np.array(labels2)))
+                    results['gt_bboxes'] = np.vstack((list(results['gt_bboxes']), boxes2))
+
+                results['img'] = mixup_image
+
+                # if the image2 has not bboxes, the 'gt_labels' and 'gt_bboxes' need to be doubled
+                # so at the end the half of loss weight can be added as 1 instead of 0.5
+                # if boxes2 == []:
+                #     results['gt_labels'] = np.hstack((labels1, labels1))
+                #     results['gt_bboxes'] = np.vstack((list(results['gt_bboxes']), list(results['gt_bboxes'])))
+                # else:
+
+                return results
+            else:
+                return results
+
+    def __repr__(self):
+        return self.__class__.__name__ + '(prob={}, lambd={}, mixup={}, json_path={}, img_path={})'.format(self.prob,
+                                                                                                           self.lambd,
+                                                                                                           self.mixup,
+                                                                                                           self.json_path,
+                                                                                                           self.img_path)
+
+
+class BufferTransform(object):
+    def __init__(self, min_buffer_size, p=0.5):
+        self.p = p
+        self.min_buffer_size = min_buffer_size
+        self.buffer = []
+
+    def apply(self, results):
+        raise NotImplementedError
+
+    def __call__(self, results):
+        if len(self.buffer) < self.min_buffer_size:
+            self.buffer.append(results.copy())
+            return None
+        if np.random.rand() <= self.p and len(self.buffer) >= self.min_buffer_size:
+            random.shuffle(self.buffer)
+            return self.apply(results)
+        return results
+
+    def __repr__(self):
+        repr_str = self.__class__.__name__
+        repr_str += f"(\nmin_buffer_size={self.min_buffer_size}),\n"
+        repr_str += f"(\nratio={self.p})"
+        return repr_str
+
+
+@PIPELINES.register_module()
+class Mosaic(BufferTransform):
+    """
+    Based on https://github.com/dereyly/mmdet_sota
+    """
+
+    def __init__(self, img_scale, min_buffer_size=4, p=0.5, pad_val=0):
+        assert min_buffer_size >= 4, "Buffer size for mosaic should be at least 4!"
+        super(Mosaic, self).__init__(min_buffer_size=min_buffer_size, p=p)
+        self.pad_val = pad_val
+        self.img_scale = img_scale
+        #self.num = 0
+
+    def apply(self, results):
+        # take four images
+        a = self.buffer.pop()
+        b = self.buffer.pop()
+        c = self.buffer.pop()
+        d = self.buffer.pop()
+        # get max shape
+        max_h = max(a["img"].shape[0], b["img"].shape[0], c["img"].shape[0], d["img"].shape[0])
+        max_w = max(a["img"].shape[1], b["img"].shape[1], c["img"].shape[1], d["img"].shape[1])
+
+        # cropping pipe
+        padder = Pad(size=(max_h, max_w), pad_val=self.pad_val)
+
+        # crop
+        a, b, c, d = padder(a), padder(b), padder(c), padder(d)
+
+        # check if cropping returns None => see above in the definition of RandomCrop
+        if not a or not b or not c or not d:
+            return results
+
+        # offset bboxes in stacked image
+        def offset_bbox(res_dict, x_offset, y_offset, keys=("gt_bboxes", "gt_bboxes_ignore")):
+            for k in keys:
+                if k in res_dict and res_dict[k].size > 0:
+                    res_dict[k][:, 0::2] += x_offset
+                    res_dict[k][:, 1::2] += y_offset
+            return res_dict
+
+        b = offset_bbox(b, max_w, 0)
+        c = offset_bbox(c, 0, max_h)
+        d = offset_bbox(d, max_w, max_h)
+
+        # collect all the data into result
+        top = np.concatenate([a["img"], b["img"]], axis=1)
+        bottom = np.concatenate([c["img"], d["img"]], axis=1)
+        results["img"] = np.concatenate([top, bottom], axis=0)
+        results["img_shape"] = (max_h * 2, max_w * 2)
+
+        for key in ["gt_labels", "gt_bboxes", "gt_labels_ignore", "gt_bboxes_ignore"]:
+            if key in results:
+                results[key] = np.concatenate([a[key], b[key], c[key], d[key]], axis=0)
+
+        img, w_scale, h_scale = mmcv.imresize(results["img"],self.img_scale,return_scale=True,backend="cv2")
+        results["img"] = img
+        scale_factor = np.array([w_scale, h_scale, w_scale, h_scale],dtype=np.float32)
+        results['img_shape'] = img.shape
+        results['pad_shape'] = img.shape
+        results['scale_factor'] = scale_factor
+        results['keep_ratio'] = False
+
+        img_shape = results['img_shape']
+        for key in results.get('bbox_fields', []):
+            bboxes = results[key] * results['scale_factor']
+            bboxes[:, 0::2] = np.clip(bboxes[:, 0::2], 0, img_shape[1])
+            bboxes[:, 1::2] = np.clip(bboxes[:, 1::2], 0, img_shape[0])
+            results[key] = bboxes
+
+        #print('mosaic...')            
+        #draw_img = img.copy()
+        #for bboxes in results['gt_bboxes']:
+        #    cv2.rectangle(draw_img,(int(bboxes[0]),int(bboxes[1])),(int(bboxes[2]),int(bboxes[3])),(0,0,255),3)
+        #cv2.imwrite("/home/willer/heywhale/UniverseNet/mmdet/datasets/pipelines/output/" + str(self.num) + ".jpg",draw_img)
+        #self.num+=1
+
+        return results
+
+    def __repr__(self):
+        repr_str = self.__repr__()
+        repr_str += f"(\npad_val={self.pad_val})"
+        return repr_str
+
+@PIPELINES.register_module()
+class Mosaic_full(object):
+    """Mosaic augmentation.
+    Given 4 images, Mosaic augmentation randomly crop a patch on each image
+    and combine them into one output image. The output image is composed of
+    the parts from each sub-image.
+                        output image
+                                cut_x
+               +-----------------------------+
+               |     image 0      | image 1  |
+               |                  |          |
+        cut_y  |------------------+----------|
+               |     image 2      | image 3  |
+               |                  |          |
+               |                  |          |
+               |                  |          |
+               |                  |          |
+               |                  |          |
+               +-----------------------------+
+    Args:
+        size (tuple[int]): output image size in (h,w).
+        min_offset (float | tuple[float]): Volume of the offset
+            of the cropping window. If float, both height and width are
+        dataset (torch.nn.Dataset): Dataset with augmentation pipeline.
+    """
+
+    def __init__(self, size=(640, 640), min_offset=0.2, dataset=None):
+
+        assert isinstance(size, tuple)
+        assert isinstance(size[0], int) and isinstance(size[1], int)
+        if size[0] <= 0 or size[1] <= 0:
+            raise ValueError('image size must > 0 in train mode')
+
+        if isinstance(min_offset, float):
+            assert 0 <= min_offset <= 1
+            self.min_offset = (min_offset, min_offset)
+        elif isinstance(min_offset, tuple):
+            assert isinstance(min_offset[0], float) \
+                   and isinstance(min_offset[1], float)
+            assert 0 <= min_offset[0] <= 1 and \
+                   0 <= min_offset[1] <= 1
+            self.min_offset = min_offset
+        else:
+            raise TypeError('Unsupported type for min_offset, '
+                            'should be either float or tuple[float]')
+
+        self.size = size
+        self.dataset = dataset
+        self.cropper = RandomCrop(crop_size=size)
+        self.num_sample = len(dataset)
+
+    def __call__(self, results):
+        """Call the function to mix 4 images.
+        Args:
+            results (dict): Result dict from loading pipeline.
+        Returns:
+            dict: Result dict with images and bounding boxes cropped.
+        """
+        # Generate the Mosaic coordinate
+        cut_y = random.randint(
+            int(self.size[0] * self.min_offset[0]),
+            int(self.size[0] * (1 - self.min_offset[0])))
+        cut_x = random.randint(
+            int(self.size[1] * self.min_offset[1]),
+            int(self.size[1] * (1 - self.min_offset[1])))
+
+        cut_position = (cut_y, cut_x)
+        tmp_result = copy.deepcopy(results)
+        # create the image buffer and mask buffer
+        tmp_result['img'] = np.zeros(
+            (self.size[0], self.size[1], *tmp_result['img'].shape[2:]),
+            dtype=tmp_result['img'].dtype)
+
+        for key in tmp_result.get('seg_fields', []):
+            tmp_result[key] = np.zeros(
+                (self.size[0], self.size[1], *tmp_result[key].shape[2:]),
+                dtype=tmp_result[key].dtype)
+        tmp_result['img_shape'] = self.size
+
+        out_bboxes = []
+        out_labels = []
+        out_ignores = []
+
+        for loc in ('top_left', 'top_right', 'bottom_left', 'bottom_right'):
+            if loc == 'top_left':
+                # use the current image
+                results_i = copy.deepcopy(results)
+            else:
+                # randomly sample a new image from the dataset
+                index = random.randint(self.num_sample)
+                results_i = copy.deepcopy(self.dataset.__getitem__(index))
+
+            # compute the crop parameters
+            crop_size, img_slices, paste_position = self._mosiac_combine(
+                loc, cut_position)
+
+            self.cropper.crop_size = crop_size
+            results_i = self.cropper(results_i)
+
+            tmp_result['img'][img_slices] = results_i['img'].copy()
+            for key in tmp_result.get('seg_fields', []):
+                tmp_result[key][img_slices] = results_i[key].copy()
+
+            results_i = self._adjust_coordinate(results_i, paste_position)
+
+            out_bboxes.append(results_i['gt_bboxes'])
+            out_labels.append(results_i['gt_labels'])
+            out_ignores.append(results_i['gt_bboxes_ignore'])
+
+        out_bboxes = np.concatenate(out_bboxes, axis=0)
+        out_labels = np.concatenate(out_labels, axis=0)
+        out_ignores = np.concatenate(out_ignores, axis=0)
+
+        tmp_result['gt_bboxes'] = out_bboxes
+        tmp_result['gt_labels'] = out_labels
+        tmp_result['gt_bboxes_ignore'] = out_ignores
+
+        return tmp_result
+
+    def _mosiac_combine(self, loc, cut_position):
+        """Crop the subimage, change the label and mix the image.
+        Args:
+            loc (str): Index for the subimage, loc in ('top_left',
+                'top_right', 'bottom_left', 'bottom_right').
+            results (dict): Result dict from loading pipeline.
+            img (numpy array): buffer for mosiac image, (H x W x 3).
+            cut_position (tuple[int]): mixing center for 4 images, (y, x).
+        Returns:
+            bboxes: Result dict with images and bounding boxes cropped.
+        """
+        if loc == 'top_left':
+            # Image 0: top left
+            crop_size = cut_position
+            img_slices = (slice(0, cut_position[0]), slice(0, cut_position[1]))
+            paste_position = (0, 0)
+        elif loc == 'top_right':
+            # Image 1: top right
+            crop_size = (cut_position[0], self.size[1] - cut_position[1])
+            img_slices = (slice(0, cut_position[0]),
+                          slice(cut_position[1], self.size[1]))
+            paste_position = (0, cut_position[1])
+        elif loc == 'bottom_left':
+            # Image 2: bottom left
+            crop_size = (self.size[0] - cut_position[0], cut_position[1])
+            img_slices = (slice(cut_position[0],
+                                self.size[0]), slice(0, cut_position[1]))
+            paste_position = (cut_position[0], 0)
+        elif loc == 'bottom_right':
+            # Image 3: bottom right
+            crop_size = (self.size[0] - cut_position[0],
+                         self.size[1] - cut_position[1])
+            img_slices = (slice(cut_position[0], self.size[0]),
+                          slice(cut_position[1], self.size[1]))
+            paste_position = cut_position
+
+        return crop_size, img_slices, paste_position
+
+    def _adjust_coordinate(self, results, paste_position):
+        """Convert subimage coordinate to mosaic image coordinate.
+         Args:
+            results (dict): Result dict from :obj:`dataset`.
+            paste_position (tuple[int]): paste up-left corner
+                coordinate (y, x) in moaiac image.
+        Returns:
+            results (dict): Result dict with corrected bbox
+                and mask coordinate.
+        """
+
+        for key in results.get('bbox_fields', []):
+            box = results[key]
+            box[:, 0::2] += paste_position[1]
+            box[:, 1::3] += paste_position[0]
+            results[key] = box
+
+        return results
+
+@PIPELINES.register_module
+class BBoxJitter(object):
+    """
+    bbox jitter
+    Args:
+        min (int, optional): min scale
+        max (int, optional): max scale
+        ## origin w scale
+    """
+
+    def __init__(self, min=0, max=2):
+        self.min_scale = min
+        self.max_scale = max
+        self.count = 0
+        ic("USE BBOX_JITTER")
+        ic(min, max)
+
+    def bbox_jitter(self, bboxes, img_shape):
+        """Flip bboxes horizontally.
+        Args:
+            bboxes(ndarray): shape (..., 4*k)
+            img_shape(tuple): (height, width)
+        """
+        assert bboxes.shape[-1] % 4 == 0
+        if len(bboxes) == 0:
+            return bboxes
+        jitter_bboxes = []
+        for box in bboxes:
+            w = box[2] - box[0]
+            h = box[3] - box[1]
+            center_x = (box[0] + box[2]) / 2
+            center_y = (box[1] + box[3]) / 2
+            scale = np.random.uniform(self.min_scale, self.max_scale)
+            w = w * scale / 2.
+            h = h * scale / 2.
+            xmin = center_x - w
+            ymin = center_y - h
+            xmax = center_x + w
+            ymax = center_y + h
+            box2 = np.array([xmin, ymin, xmax, ymax], dtype=np.float32)
+            jitter_bboxes.append(box2)
+        jitter_bboxes = np.array(jitter_bboxes, dtype=np.float32)
+        jitter_bboxes[:, 0::2] = np.clip(jitter_bboxes[:, 0::2], 0, img_shape[1] - 1)
+        jitter_bboxes[:, 1::2] = np.clip(jitter_bboxes[:, 1::2], 0, img_shape[0] - 1)
+        return jitter_bboxes
+
+    def __call__(self, results):
+        for key in results.get('bbox_fields', []):
+            results[key] = self.bbox_jitter(results[key],
+                                          results['img_shape'])
+        return results
+
+    def __repr__(self):
+        return self.__class__.__name__ + '(bbox_jitter={}-{})'.format(
+            self.min_scale, self.max_scale)
+
+@PIPELINES.register_module
+class Grid(object):
+    def __init__(self, use_h, use_w, rotate=1, offset=False, ratio=0.5, mode=1, prob=0.7):
+        self.use_h = use_h
+        self.use_w = use_w
+        self.rotate = rotate
+        self.offset = offset
+        self.ratio = ratio
+        self.mode = mode
+        self.st_prob = prob
+        self.prob = prob
+
+    def __call__(self, results):
+        img = results['img']
+        if np.random.rand() > self.prob:
+            return results
+        h = img.shape[0]
+        w = img.shape[1]
+        self.d1 = 2
+        self.d2 = min(h, w)
+        hh = int(1.5 * h)
+        ww = int(1.5 * w)
+        d = np.random.randint(self.d1, self.d2)
+        # d = self.d
+        #        self.l = int(d*self.ratio+0.5)
+        if self.ratio == 1:
+            self.l = np.random.randint(1, d)
+        else:
+            self.l = min(max(int(d * self.ratio + 0.5), 1), d - 1)
+        mask = np.ones((hh, ww), np.float32)
+        st_h = np.random.randint(d)
+        st_w = np.random.randint(d)
+        if self.use_h:
+            for i in range(hh // d):
+                s = d * i + st_h
+                t = min(s + self.l, hh)
+                mask[s:t, :] *= 0
+        if self.use_w:
+            for i in range(ww // d):
+                s = d * i + st_w
+                t = min(s + self.l, ww)
+                mask[:, s:t] *= 0
+
+        r = np.random.randint(self.rotate)
+        mask = Image.fromarray(np.uint8(mask))
+        mask = mask.rotate(r)
+        mask = np.asarray(mask)
+        #        mask = 1*(np.random.randint(0,3,[hh,ww])>0)
+        mask = mask[(hh - h) // 2:(hh - h) // 2 + h, (ww - w) // 2:(ww - w) // 2 + w]
+
+        mask = mask.astype(np.float32)
+        if self.mode == 1:
+            mask = 1 - mask
+
+        # mask = mask.expand_as(img)
+        mask = np.expand_dims(mask, 2).repeat(3, axis=2)
+        if self.offset:
+            offset = 2 * (np.random.rand(h, w) - 0.5)
+            offset = (1 - mask) * offset
+            img = img * mask + offset
+        else:
+            img = img * mask
+        results['img'] = img
+        return results
+
+    def __repr__(self):
+        repr_str = self.__class__.__name__
+        repr_str += '(use_h={}, use_w={}, rotate={}, offset={}, ratio={}, mode={}, prob={})'.format(
+            self.use_h, self.use_w, self.rotate, self.offset, self.ratio, self.mode, self.prob)
+        return repr_str
+
+@PIPELINES.register_module
+class FenceMask(object):
+    def __init__(self, mask_h=100, mask_w=100, r=5, prob=0.5):
+        self.prob = prob
+        self.mask_h = mask_h
+        self.mask_w = mask_w
+        self.r = r
+
+    def __call__(self, results):
+        img = results['img']
+        if np.random.rand() > self.prob:
+            return results
+
+        mask = np.ones((img.shape[0],img.shape[1]), np.float32)
+        for sw in range(self.mask_w, img.shape[1], self.mask_w):
+            if sw+self.r<img.shape[1]:
+                mask[:,sw-self.r:sw+self.r] = 0
+
+        for sh in range(self.mask_h, img.shape[0], self.mask_h):
+            if sh+self.r<img.shape[0]:
+                mask[sh-self.r:sh+self.r,:] = 0
+
+        mask = np.expand_dims(mask, 2).repeat(3, axis=2)
+
+        results['img'] = img*mask
+        return results
+
 
 
 @PIPELINES.register_module()
@@ -322,61 +1005,18 @@ class RandomFlip(object):
     otherwise it will be randomly decided by a ratio specified in the init
     method.
 
-    When random flip is enabled, ``flip_ratio``/``direction`` can either be a
-    float/string or tuple of float/string. There are 3 flip modes:
-
-    - ``flip_ratio`` is float, ``direction`` is string: the image will be
-        ``direction``ly flipped with probability of ``flip_ratio`` .
-        E.g., ``flip_ratio=0.5``, ``direction='horizontal'``,
-        then image will be horizontally flipped with probability of 0.5.
-    - ``flip_ratio`` is float, ``direction`` is list of string: the image wil
-        be ``direction[i]``ly flipped with probability of
-        ``flip_ratio/len(direction)``.
-        E.g., ``flip_ratio=0.5``, ``direction=['horizontal', 'vertical']``,
-        then image will be horizontally flipped with probability of 0.25,
-        vertically with probability of 0.25.
-    - ``flip_ratio`` is list of float, ``direction`` is list of string:
-        given ``len(flip_ratio) == len(direction)``, the image wil
-        be ``direction[i]``ly flipped with probability of ``flip_ratio[i]``.
-        E.g., ``flip_ratio=[0.3, 0.5]``, ``direction=['horizontal',
-        'vertical']``, then image will be horizontally flipped with probability
-         of 0.3, vertically with probability of 0.5
-
     Args:
-        flip_ratio (float | list[float], optional): The flipping probability.
-            Default: None.
-        direction(str | list[str], optional): The flipping direction. Options
-            are 'horizontal', 'vertical', 'diagonal'. Default: 'horizontal'.
-            If input is a list, the length must equal ``flip_ratio``. Each
-            element in ``flip_ratio`` indicates the flip probability of
-            corresponding direction.
+        flip_ratio (float, optional): The flipping probability. Default: None.
+        direction(str, optional): The flipping direction. Options are
+            'horizontal' and 'vertical'. Default: 'horizontal'.
     """
 
     def __init__(self, flip_ratio=None, direction='horizontal'):
-        if isinstance(flip_ratio, list):
-            assert mmcv.is_list_of(flip_ratio, float)
-            assert 0 <= sum(flip_ratio) <= 1
-        elif isinstance(flip_ratio, float):
-            assert 0 <= flip_ratio <= 1
-        elif flip_ratio is None:
-            pass
-        else:
-            raise ValueError('flip_ratios must be None, float, '
-                             'or list of float')
         self.flip_ratio = flip_ratio
-
-        valid_directions = ['horizontal', 'vertical', 'diagonal']
-        if isinstance(direction, str):
-            assert direction in valid_directions
-        elif isinstance(direction, list):
-            assert mmcv.is_list_of(direction, str)
-            assert set(direction).issubset(set(valid_directions))
-        else:
-            raise ValueError('direction must be either str or list of str')
         self.direction = direction
-
-        if isinstance(flip_ratio, list):
-            assert len(self.flip_ratio) == len(self.direction)
+        if flip_ratio is not None:
+            assert flip_ratio >= 0 and flip_ratio <= 1
+        assert direction in ['horizontal', 'vertical']
 
     def bbox_flip(self, bboxes, img_shape, direction):
         """Flip bboxes horizontally.
@@ -401,13 +1041,6 @@ class RandomFlip(object):
             h = img_shape[0]
             flipped[..., 1::4] = h - bboxes[..., 3::4]
             flipped[..., 3::4] = h - bboxes[..., 1::4]
-        elif direction == 'diagonal':
-            w = img_shape[1]
-            h = img_shape[0]
-            flipped[..., 0::4] = w - bboxes[..., 2::4]
-            flipped[..., 1::4] = h - bboxes[..., 3::4]
-            flipped[..., 2::4] = w - bboxes[..., 0::4]
-            flipped[..., 3::4] = h - bboxes[..., 1::4]
         else:
             raise ValueError(f"Invalid flipping direction '{direction}'")
         return flipped
@@ -425,28 +1058,10 @@ class RandomFlip(object):
         """
 
         if 'flip' not in results:
-            if isinstance(self.direction, list):
-                # None means non-flip
-                direction_list = self.direction + [None]
-            else:
-                # None means non-flip
-                direction_list = [self.direction, None]
-
-            if isinstance(self.flip_ratio, list):
-                non_flip_ratio = 1 - sum(self.flip_ratio)
-                flip_ratio_list = self.flip_ratio + [non_flip_ratio]
-            else:
-                non_flip_ratio = 1 - self.flip_ratio
-                # exclude non-flip
-                single_ratio = self.flip_ratio / (len(direction_list) - 1)
-                flip_ratio_list = [single_ratio] * (len(direction_list) -
-                                                    1) + [non_flip_ratio]
-
-            cur_dir = np.random.choice(direction_list, p=flip_ratio_list)
-
-            results['flip'] = cur_dir is not None
+            flip = True if np.random.rand() < self.flip_ratio else False
+            results['flip'] = flip
         if 'flip_direction' not in results:
-            results['flip_direction'] = cur_dir
+            results['flip_direction'] = self.direction
         if results['flip']:
             # flip image
             for key in results.get('img_fields', ['img']):
@@ -1619,207 +2234,139 @@ class RandomCenterCropPad(object):
         repr_str += f'test_mode={self.test_mode}, '
         repr_str += f'test_pad_mode={self.test_pad_mode})'
         return repr_str
-
-
-@PIPELINES.register_module()
-class CutOut(object):
-    """CutOut operation.
-
-    Randomly drop some regions of image used in
-    `Cutout <https://arxiv.org/abs/1708.04552>`_.
+def mybbox_overlaps(bboxes1, bboxes2, mode='iou',fg_first=True):
+    """Calculate the ious between each bbox of bboxes1 and bboxes2.
 
     Args:
-        n_holes (int | tuple[int, int]): Number of regions to be dropped.
-            If it is given as a list, number of holes will be randomly
-            selected from the closed interval [`n_holes[0]`, `n_holes[1]`].
-        cutout_shape (tuple[int, int] | list[tuple[int, int]]): The candidate
-            shape of dropped regions. It can be `tuple[int, int]` to use a
-            fixed cutout shape, or `list[tuple[int, int]]` to randomly choose
-            shape from the list.
-        cutout_ratio (tuple[float, float] | list[tuple[float, float]]): The
-            candidate ratio of dropped regions. It can be `tuple[float, float]`
-            to use a fixed ratio or `list[tuple[float, float]]` to randomly
-            choose ratio from the list. Please note that `cutout_shape`
-            and `cutout_ratio` cannot be both given at the same time.
-        fill_in (tuple[float, float, float] | tuple[int, int, int]): The value
-            of pixel to fill in the dropped regions. Default: (0, 0, 0).
+        bboxes1(ndarray): shape (n, 4)
+        bboxes2(ndarray): shape (k, 4)
+        mode(str): iou (intersection over union) or iof (intersection
+            over foreground)
+
+    Returns:
+        ious(ndarray): shape (n, k)
     """
 
-    def __init__(self,
-                 n_holes,
-                 cutout_shape=None,
-                 cutout_ratio=None,
-                 fill_in=(0, 0, 0)):
+    assert mode in ['iou', 'iof']
 
-        assert (cutout_shape is None) ^ (cutout_ratio is None), \
-            'Either cutout_shape or cutout_ratio should be specified.'
-        assert (isinstance(cutout_shape, (list, tuple))
-                or isinstance(cutout_ratio, (list, tuple)))
-        if isinstance(n_holes, tuple):
-            assert len(n_holes) == 2 and 0 <= n_holes[0] < n_holes[1]
+    bboxes1 = bboxes1.astype(np.float32)
+    bboxes2 = bboxes2.astype(np.float32)
+    rows = bboxes1.shape[0]
+    cols = bboxes2.shape[0]
+    ious = np.zeros((rows, cols), dtype=np.float32)
+    if rows * cols == 0:
+        return ious
+
+    area1 = (bboxes1[:, 2] - bboxes1[:, 0] + 1) * (
+        bboxes1[:, 3] - bboxes1[:, 1] + 1)
+    area2 = (bboxes2[:, 2] - bboxes2[:, 0] + 1) * (
+        bboxes2[:, 3] - bboxes2[:, 1] + 1)
+    for i in range(bboxes1.shape[0]):
+        x_start = np.maximum(bboxes1[i, 0], bboxes2[:, 0])
+        y_start = np.maximum(bboxes1[i, 1], bboxes2[:, 1])
+        x_end = np.minimum(bboxes1[i, 2], bboxes2[:, 2])
+        y_end = np.minimum(bboxes1[i, 3], bboxes2[:, 3])
+        overlap = np.maximum(x_end - x_start + 1, 0) * np.maximum(
+            y_end - y_start + 1, 0)
+        if mode == 'iou':
+            union = area1[i] + area2 - overlap
         else:
-            n_holes = (n_holes, n_holes)
-        self.n_holes = n_holes
-        self.fill_in = fill_in
-        self.with_ratio = cutout_ratio is not None
-        self.candidates = cutout_ratio if self.with_ratio else cutout_shape
-        if not isinstance(self.candidates, list):
-            self.candidates = [self.candidates]
+            union = area1[i] if fg_first else area2
+        ious[i, :] = overlap / union
 
+    return ious
+@PIPELINES.register_module
+class RandomSample(object):
+
+    def __init__(self, min_scale = 5,min_iof=0.4, crop_size=(1280,720),min_box_ratio=0.2,full_image_ratio=0,rgb_mean=[0,0,0]):
+        # 1: return ori img
+        self.min_iof = min_iof
+        self.crop_size = crop_size
+        self.min_scale = min_scale
+        self.min_box_ratio = min_box_ratio
+        self.full_image_ratio   = full_image_ratio
+        self.mean = rgb_mean[::-1] #[fix] the mean in mmdection's config is rgb order
     def __call__(self, results):
-        """Call function to drop some regions of image."""
-        h, w, c = results['img'].shape
-        n_holes = np.random.randint(self.n_holes[0], self.n_holes[1] + 1)
-        for _ in range(n_holes):
-            x1 = np.random.randint(0, w)
-            y1 = np.random.randint(0, h)
-            index = np.random.randint(0, len(self.candidates))
-            if not self.with_ratio:
-                cutout_w, cutout_h = self.candidates[index]
-            else:
-                cutout_w = int(self.candidates[index][0] * w)
-                cutout_h = int(self.candidates[index][1] * h)
+        img, boxes, labels = results['img'], results['gt_bboxes'], results['gt_labels']
+        h, w, c = img.shape
+        
+        while True:
+            for i in range(50):
+                if self.full_image_ratio>0:
+                    if np.random.uniform()<self.full_image_ratio:
+                        return img,boxes,labels
+                
+                new_w = self.crop_size[0]
+                new_h = self.crop_size[1]
 
-            x2 = np.clip(x1 + cutout_w, 0, w)
-            y2 = np.clip(y1 + cutout_h, 0, h)
-            results['img'][y1:y2, x1:x2, :] = self.fill_in
+        
+               # [fix]
+                left,top = 0,0
+                fill_left,fill_top = 0,0
+                if new_w<=w:
+                    left = random.uniform(0,w - new_w)
+                else:
+                    fill_left = int(random.uniform(0,new_w-w))
+                if new_h<=h:
+                    top = random.uniform(0,h - new_h)
+                else:
+                    fill_top = int(random.uniform(0,new_h-h))
 
-        return results
+                crop_img = np.full((new_h, new_w, c),
+                                self.mean).astype(img.dtype)
 
-    def __repr__(self):
-        repr_str = self.__class__.__name__
-        repr_str += f'(n_holes={self.n_holes}, '
-        repr_str += (f'cutout_ratio={self.candidates}, ' if self.with_ratio
-                     else f'cutout_shape={self.candidates}, ')
-        repr_str += f'fill_in={self.fill_in})'
-        return repr_str
+                patch = np.array((int(left), int(top), int(left + new_w),
+                                  int(top + new_h)))
 
+                #
+                overlaps = mybbox_overlaps(patch.reshape(-1, 4), boxes.reshape(-1, 4),mode='iof',fg_first=False).reshape(-1)
+                # [bugfix]
+                mask = (overlaps>self.min_iof)* ((boxes[:,2]-boxes[:,0])*(boxes[:,3]-boxes[:,1])*overlaps>self.min_scale*self.min_scale)
+                # if not mask.any(): 
+                #     continue
+                if (mask.sum()/float(boxes.shape[0]))<self.min_box_ratio:
+                    continue
+                boxes = boxes[mask]
+                labels = labels[mask]
+      
+                # [fix]
+                crop_img[fill_top:fill_top+h, fill_left:fill_left+w] = img[patch[1]:patch[3], patch[0]:patch[2]]
+                # adjust boxes
+                boxes[:, 2:] = boxes[:, 2:].clip(max=patch[2:])
+                boxes[:, :2] = boxes[:, :2].clip(min=patch[:2])
+                #mask = labels!=2
+                #boxes[mask, 2:] = boxes[mask, 2:].clip(max=patch[2:])
+                #boxes[mask, :2] = boxes[mask, :2].clip(min=patch[:2]) 
+                boxes -= np.tile(patch[:2], 2)
+                boxes += np.tile([fill_left,fill_top], 2) 
+                
+                # output
+                img_shape = crop_img.shape
+                results['img'] = crop_img
+                results['img_shape'] = img_shape
+                results['gt_bboxes'] = boxes
+                if 'gt_labels' in results:
+                    results['gt_labels'] = labels
 
-@PIPELINES.register_module()
-class SoftGridMask(object):
-    """SoftGridMask augmentation.
+                return results
+            img,w_scale,h_scale = mmcv.imresize(img, self.crop_size,return_scale=True)
+            scale_factor = w_scale,h_scale
+            boxes[:,:2] = boxes[:,:2]*scale_factor
+            boxes[:,2:] = boxes[:,2:]*scale_factor
+            # outputrfc 2 
+            img_shape = img.shape
+            results['img'] = img
+            results['img_shape'] = img_shape
+            results['gt_bboxes'] = boxes
+            if 'gt_labels' in results:
+                results['gt_labels'] = labels
 
-    This augmentation is an extension of
-    `GridMask Data Augmentation <https://arxiv.org/abs/2001.04086>`_.
-    Unlike the hard (bool value) mask of the original GridMask,
-    various soft (float value) mask patterns can be specified by mask_pattern.
-
-    References:
-        https://github.com/Jia-Research-Lab/GridMask/blob/master/detection_grid/maskrcnn_benchmark/data/transforms/grid.py
-        https://github.com/albumentations-team/albumentations/blob/master/albumentations/augmentations/transforms.py
-    """
-
-    def __init__(self,
-                 ratio=0.5,
-                 ratio_h=None,
-                 ratio_w=None,
-                 unit_range=(2, 100000),
-                 unit_h_range=None,
-                 unit_w_range=None,
-                 mask_pattern=((1.0, 1.0), (1.0, 0.0)),
-                 mask_pattern_max=None,
-                 square_unit=True,
-                 prob=0.7):
-        assert (ratio is None) ^ (ratio_h is None)
-        assert (ratio is None) ^ (ratio_w is None)
-        if ratio:
-            ratio_h = ratio_w = ratio
-        assert 0.0 <= ratio_h <= 1.0
-        assert 0.0 <= ratio_w <= 1.0
-        self.ratio_h = ratio_h
-        self.ratio_w = ratio_w
-
-        assert (unit_range is None) ^ (unit_h_range is None)
-        assert (unit_range is None) ^ (unit_w_range is None)
-        if unit_range:
-            unit_h_range = unit_w_range = unit_range
-        assert isinstance(unit_h_range, tuple) and len(unit_h_range) == 2
-        assert isinstance(unit_w_range, tuple) and len(unit_w_range) == 2
-        self.unit_h_range = unit_h_range
-        self.unit_w_range = unit_w_range
-        self.unit_h_min, self.unit_h_max = unit_h_range
-        self.unit_w_min, self.unit_w_max = unit_w_range
-        assert 2 <= self.unit_h_min <= self.unit_h_max
-        assert 2 <= self.unit_w_min <= self.unit_w_max
-
-        mask_pattern = np.array(mask_pattern)
-        assert mask_pattern.shape == (2, 2), \
-            'Only 2x2 pattern is supported currently.'
-        if mask_pattern_max is not None:
-            mask_pattern_max = np.array(mask_pattern_max)
-            assert mask_pattern_max.shape == (2, 2), \
-                'Only 2x2 pattern is supported currently.'
-        self.mask_pattern = mask_pattern
-        self.mask_pattern_max = mask_pattern_max
-
-        assert 0.0 <= prob <= 1.0
-        self.square_unit = square_unit
-        self.prob = prob
-
-    # @imwrite_denormalized_debug_img
-    def __call__(self, results):
-        """Call function to perform SoftGridMask augmentation on images.
-
-        Args:
-            results (dict): Result dict from loading pipeline.
-
-        Returns:
-            dict: Result dict with grid-masked images.
-        """
-
-        if random.uniform(0, 1) > self.prob:
             return results
-        if len(results.get('mask_fields', [])) > 0:
-            raise NotImplementedError
-
-        img_h, img_w = results['img'].shape[:2]
-        unit_h_max = min(img_h, img_w, self.unit_h_max)
-        unit_h = random.randint(self.unit_h_min, unit_h_max + 1)
-        if self.square_unit:
-            unit_w = unit_h
-        else:
-            unit_w_max = min(img_h, img_w, self.unit_w_max)
-            unit_w = random.randint(self.unit_w_min, unit_w_max + 1)
-        shift_y = random.randint(unit_h)
-        shift_x = random.randint(unit_w)
-
-        # calculate border position
-        # each grid should be at least 1 pixel
-        border_h = int(unit_h * self.ratio_h + 0.5)
-        border_w = int(unit_w * self.ratio_w + 0.5)
-        border_h = min(max(border_h, 1), unit_h - 1)
-        border_w = min(max(border_w, 1), unit_w - 1)
-
-        if self.mask_pattern_max is not None:
-            mask_pattern = random.uniform(self.mask_pattern,
-                                          self.mask_pattern_max)
-        else:
-            mask_pattern = self.mask_pattern
-
-        # prepare mask by tiling unit
-        unit_mask = np.ones((unit_h, unit_w), dtype=np.float32)
-        unit_mask[:border_h, :border_w] = mask_pattern[0, 0]
-        unit_mask[:border_h, border_w:] = mask_pattern[0, 1]
-        unit_mask[border_h:, :border_w] = mask_pattern[1, 0]
-        unit_mask[border_h:, border_w:] = mask_pattern[1, 1]
-        repeat_h = img_h // unit_h + 2  # +1 for ceil, +1 for shift
-        repeat_w = img_w // unit_w + 2  # +1 for ceil, +1 for shift
-        mask = np.tile(unit_mask, (repeat_h, repeat_w))
-
-        # crop mask with shift
-        mask = mask[shift_y:shift_y + img_h, shift_x:shift_x + img_w]
-
-        results['img'] *= mask[:, :, np.newaxis]
-        return results
-
     def __repr__(self):
-        repr_str = self.__class__.__name__
-        repr_str += f'(ratio_h={self.ratio_h}, '
-        repr_str += f'ratio_w={self.ratio_w}, '
-        repr_str += f'unit_h_range={self.unit_h_range}, '
-        repr_str += f'unit_w_range={self.unit_w_range}, '
-        repr_str += f'mask_pattern={self.mask_pattern}, '
-        repr_str += f'mask_pattern_max={self.mask_pattern_max}, '
-        repr_str += f'square_unit={self.square_unit}, '
-        repr_str += f'prob={self.prob})'
-        return repr_str
+        return self.__class__.__name__ \
+                + f'(min_iof={self.min_iof})' \
+                + f'(crop_size={self.crop_size})' \
+                + f'(min_scale={self.min_scale})' \
+                + f'(min_box_ratio={self.min_box_ratio})' \
+                + f'(full_image_ratio={self.full_image_ratio})' \
+                + f'(mean={self.mean})'                 
